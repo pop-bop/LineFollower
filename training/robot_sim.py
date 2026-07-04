@@ -2,7 +2,9 @@ import pybullet as p
 import pybullet_data
 import numpy as np
 import random
+import tempfile
 from typing import Tuple
+from PIL import Image, ImageDraw
 
 from .config import TrainingConfig
 from .line_generator import ProceduralLineGenerator
@@ -19,12 +21,17 @@ class RobotSim:
         self.right_motor_joint_index = None
         self.line_generator = ProceduralLineGenerator(self.client_id, self.config)
 
+        # IMU state — updated each apply_action() call, read by get_imu_reading()
+        self._last_angular_vel = 0.0
+        self._last_linear_vel  = 0.0
+        self._last_action_dt   = (1.0 / 60.0) * self.config.SIMULATION_STEPS_PER_ACTION
+
         self.setup_physics()
         self.load_robot()
+        self._create_sky_people()
         self.setup_camera()
-        # Pre-allocate image buffer: avoids repeated numpy allocation on every get_camera_image() call.
-        # Must be int32 — PyBullet getCameraImage returns raw RGBA as int32 packed pixels.
         self._img_buf = np.zeros((self.config.CAMERA_HEIGHT, self.config.CAMERA_WIDTH, 4), dtype=np.int32)
+        self._augment_enabled = True  # toggle off sometimes for speed
 
     def setup_physics(self):
         p.setGravity(0, 0, -9.81, physicsClientId=self.client_id)
@@ -40,26 +47,79 @@ class RobotSim:
         # Visual shape for the robot
         visual_shape_id = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.05, 0.05, 0.02],
                                              rgbaColor=[0.5, 0.5, 0.5, 1], physicsClientId=self.client_id)
-        # Collision shape for the robot
-        collision_shape_id = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.05, 0.05, 0.02], physicsClientId=self.client_id)
-        
-        # Base position and orientation
+
         base_pos = [0, 0, 0.05]
         base_orientation = p.getQuaternionFromEuler([0, 0, 0])
         
-        # Mass and inertia
-        mass = 0 # mass=0 to make it kinematic and fix Z axis/ignore gravity
+        # Mass and inertia — kinematic (no physics), position set directly.
+        mass = 0
 
         self.robot_id = p.createMultiBody(baseMass=mass,
                                           baseInertialFramePosition=[0, 0, 0],
-                                          baseCollisionShapeIndex=-1, # no collisions
+                                          baseCollisionShapeIndex=-1,
                                           baseVisualShapeIndex=visual_shape_id,
                                           basePosition=base_pos,
                                           baseOrientation=base_orientation,
                                           physicsClientId=self.client_id)
-        
-        # User requested the robot to just be a cube with no collisions (kinematic body).
-        # mass=0 means static/kinematic — gravity and contacts are ignored automatically.
+
+    def _generate_person_texture(self, size=64):
+        """Generate a simple person silhouette on a colored background."""
+        bg_colors = [(135, 206, 235), (176, 224, 230), (173, 216, 230), (152, 192, 210)]
+        person_colors = [(30, 30, 30), (50, 50, 50), (80, 40, 40), (40, 60, 40)]
+        bg = random.choice(bg_colors)
+        pc = random.choice(person_colors)
+
+        img = Image.new('RGB', (size, size), bg)
+        draw = ImageDraw.Draw(img)
+
+        cx = size // 2
+        # Head
+        head_r = size // 8
+        draw.ellipse([cx - head_r, 4, cx + head_r, 4 + head_r * 2], fill=pc)
+        # Body
+        body_top = 4 + head_r * 2 + 2
+        body_bot = size - size // 4
+        draw.rectangle([cx - size // 8, body_top, cx + size // 8, body_bot], fill=pc)
+        # Legs
+        leg_w = size // 10
+        draw.rectangle([cx - size // 6, body_bot, cx - size // 6 + leg_w, size - 2], fill=pc)
+        draw.rectangle([cx + size // 6 - leg_w, body_bot, cx + size // 6, size - 2], fill=pc)
+        # Arms
+        arm_y = body_top + (body_bot - body_top) // 3
+        draw.line([cx - size // 8, arm_y, cx - size // 3, arm_y + size // 5], fill=pc, width=2)
+        draw.line([cx + size // 8, arm_y, cx + size // 3, arm_y + size // 5], fill=pc, width=2)
+
+        return img
+
+    def _create_sky_people(self):
+        """Place textured planes with person silhouettes in the sky around the robot."""
+        self._sky_people_ids = []
+        self._sky_tex_files = []  # keep refs so OS can clean up
+        num_people = 4
+        for i in range(num_people):
+            img = self._generate_person_texture(64)
+            tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False, dir=tempfile.gettempdir())
+            img.save(tmp.name)
+            tmp.close()
+            tex_id = p.loadTexture(tmp.name, physicsClientId=self.client_id)
+            self._sky_tex_files.append(tmp.name)
+
+            angle = (2 * np.pi * i) / num_people + random.uniform(-0.3, 0.3)
+            dist = random.uniform(2.0, 4.0)
+            height = random.uniform(0.5, 1.5)
+            px = dist * np.cos(angle)
+            py = dist * np.sin(angle)
+
+            vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.15, 0.02, 0.25],
+                                      rgbaColor=[1, 1, 1, 1],
+                                      physicsClientId=self.client_id)
+            body = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=-1,
+                                     baseVisualShapeIndex=vis,
+                                     basePosition=[px, py, height],
+                                     physicsClientId=self.client_id)
+            p.changeVisualShape(body, -1, textureUniqueId=tex_id,
+                                physicsClientId=self.client_id)
+            self._sky_people_ids.append(body)
 
     def setup_camera(self):
         # Camera is attached to the robot's base
@@ -118,12 +178,9 @@ class RobotSim:
         )
         # Write directly into pre-allocated buffer, strip alpha channel
         np.copyto(self._img_buf, np.reshape(img_arr[2], (self.config.CAMERA_HEIGHT, self.config.CAMERA_WIDTH, 4)))
-        rgb = self._img_buf[:, :, :3].astype(np.uint8)  # int32 → uint8, single conversion
-
-        # CPU augmentation — runs on the image while it is still in CPU RAM.
-        # Augmenting here (before image_to_tensor) means only ONE PCIe transfer
-        # to the GPU, not multiple round-trips. NumPy ops on 320x240x3 ≈ 0.1 ms.
-        rgb = self._augment(rgb)
+        rgb = self._img_buf[:, :, :3].astype(np.uint8)
+        if self._augment_enabled:
+            rgb = self._augment(rgb)
         return rgb
 
     def _augment(self, img: np.ndarray) -> np.ndarray:
@@ -164,55 +221,74 @@ class RobotSim:
 
     def apply_action(self, action: Tuple[float, float]):
         """
-        Applies continuous motor commands to the robot.
-        action: A tuple of (left_motor, right_motor) in range [-1, 1] (tanh output).
-        Robot Y-axis is fixed: vz=0 always enforced.
+        Applies continuous motor commands to the robot via direct position
+        teleportation — fastest path, no physics engine overhead.
         """
         left_velocity_raw, right_velocity_raw = action
 
         left_velocity = left_velocity_raw * self.config.MAX_MOTOR_VELOCITY
         right_velocity = right_velocity_raw * self.config.MAX_MOTOR_VELOCITY
 
-        # Calculate desired linear and angular velocity from wheel velocities
         linear_vel = (left_velocity + right_velocity) * self.config.WHEEL_RADIUS / 2.0
         angular_vel = (right_velocity - left_velocity) * self.config.WHEEL_RADIUS / self.config.TRACK_WIDTH
 
-        # Get current robot state
         pos, ori = p.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.client_id)
-
-        # Get robot's current orientation to apply linear velocity in forward direction
         _, _, yaw = p.getEulerFromQuaternion(ori)
 
-        # Step simulation manually via Euler integration to bypass physics engine overhead
         dt = (1.0 / 60.0) * self.config.SIMULATION_STEPS_PER_ACTION
         new_yaw = yaw + angular_vel * dt
         new_x = pos[0] + linear_vel * np.cos(yaw) * dt
         new_y = pos[1] + linear_vel * np.sin(yaw) * dt
-        
-        new_pos = [new_x, new_y, pos[2]]
-        new_ori = p.getQuaternionFromEuler([0, 0, new_yaw])
-        
-        p.resetBasePositionAndOrientation(self.robot_id, new_pos, new_ori, physicsClientId=self.client_id)
 
-        # Update camera view matrix after robot moves
+        p.resetBasePositionAndOrientation(self.robot_id,
+            [new_x, new_y, pos[2]],
+            p.getQuaternionFromEuler([0, 0, new_yaw]),
+            physicsClientId=self.client_id)
+
+        self._last_angular_vel = angular_vel
+        self._last_linear_vel  = linear_vel
+        self._last_action_dt   = dt
+
         self.setup_camera()
-        # Note: resetDebugVisualizerCamera removed — GUI is disabled during training (p.DIRECT mode)
+
+    def get_imu_reading(self) -> np.ndarray:
+        """
+        Synthesize a 6-axis IMU reading (3-axis gyro + 3-axis accelerometer)
+        from the most recent apply_action() kinematics.
+
+        Robot is a planar-kinematic body (roll/pitch always 0), so:
+          gyro  = [0, 0, yaw_rate]                       — rad/s
+          accel = [forward_accel, 0, -g]                 — m/s^2, body frame
+                  (forward_accel from finite-differencing linear velocity;
+                   gravity sits entirely on body-Z since roll/pitch are 0)
+        """
+        forward_accel = (self._last_linear_vel - getattr(self, '_prev_linear_vel', 0.0)) / self._last_action_dt
+        self._prev_linear_vel = self._last_linear_vel
+
+        gyro  = np.array([0.0, 0.0, self._last_angular_vel])
+        accel = np.array([forward_accel, 0.0, -9.81])
+
+        imu = np.concatenate([gyro, accel]).astype(np.float32)
+        imu += np.random.normal(0.0, 0.02, size=imu.shape).astype(np.float32)  # sensor noise
+        return imu
 
     def reset_robot(self):
-        # Randomize initial position
+        # Randomize initial position around the true start of the track (0, 0)
         x_offset = random.uniform(*self.config.ROBOT_START_POS_OFFSET_RANGE)
         y_offset = random.uniform(*self.config.ROBOT_POS_OFFSET_RANGE) if hasattr(self.config, 'ROBOT_POS_OFFSET_RANGE') else 0.0
-        start_pos = [self.line_generator.last_segment_start_point[0] + x_offset, 
-                     self.line_generator.last_segment_start_point[1] + y_offset, 
-                     0.05] # Slightly above ground
+        start_pos = [x_offset, y_offset, 0.05] # Slightly above ground
 
-        # Randomize initial heading
+        # Randomize initial heading around the true start direction (+X axis)
         heading_offset_deg = random.uniform(*self.config.ROBOT_START_HEADING_OFFSET_RANGE)
-        start_ori_euler = p.getEulerFromQuaternion(p.getQuaternionFromEuler([0, 0, np.arctan2(self.line_generator.last_segment_start_direction[1], self.line_generator.last_segment_start_direction[0])]))
-        start_ori_euler = [start_ori_euler[0], start_ori_euler[1], start_ori_euler[2] + np.deg2rad(heading_offset_deg)]
+        start_ori_euler = [0, 0, np.deg2rad(heading_offset_deg)]
         p.resetBasePositionAndOrientation(self.robot_id, start_pos, p.getQuaternionFromEuler(start_ori_euler), physicsClientId=self.client_id)
         p.resetBaseVelocity(self.robot_id, linearVelocity=[0,0,0], angularVelocity=[0,0,0], physicsClientId=self.client_id)
         self.setup_camera() # Recalculate camera view matrix
+
+        # Reset IMU state so a new episode doesn't see a velocity discontinuity as acceleration
+        self._last_angular_vel = 0.0
+        self._last_linear_vel  = 0.0
+        self._prev_linear_vel  = 0.0
 
 
 
@@ -238,6 +314,10 @@ class RobotSim:
                      random.uniform(*self.config.SHADOW_POS_RANGE),
                      random.uniform(1.0, 5.0)] # Z always above ground
         
-        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        try:
+            data_path = pybullet_data.getDataPath()
+        except AttributeError:
+            data_path = pybullet_data.__path__[0]
+        p.setAdditionalSearchPath(data_path)
         p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 1, physicsClientId=self.client_id)
         p.setLightPosition(light_pos, physicsClientId=self.client_id)

@@ -52,7 +52,7 @@ class ReplayBuffer:
     Call clear() to wipe both tiers between phases.
     """
 
-    def __init__(self, capacity: int, ram_fraction: float = 0.05):
+    def __init__(self, capacity: int, ram_fraction: float = 0.50):
         """
         Parameters
         ----------

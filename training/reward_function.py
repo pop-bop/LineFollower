@@ -18,7 +18,13 @@ class RewardFunction:
         # Avoids calling p.getAABB + p.getBasePositionAndOrientation every step
         self._segment_cache = []   # list of (start_pt, end_pt, direction, line_vec, line_len)
         self._red_line_cache = []  # BUG FIX: must be initialised here, not only in _build_segment_cache()
-        self._obstacle_cache = []  # list of obstacle positions
+
+        # Running reward normalization (Welford's algorithm) — blunts reward-hacking
+        # of the hand-shaped terms below by keeping the AWR advantage signal on a
+        # roughly consistent scale across the whole run, not tied to raw magnitudes.
+        self._reward_count = 0
+        self._reward_mean  = 0.0
+        self._reward_m2    = 0.0   # sum of squared deviations from the mean
 
     def _build_segment_cache(self):
         """Cache all track segment geometries once per episode."""
@@ -47,12 +53,6 @@ class RewardFunction:
             if not is_red_line:
                 self._segment_cache.append((start_pt, end_pt, direction, line_vec, line_len))
 
-        self._obstacle_cache = []
-        if hasattr(self.robot_sim.line_generator, 'current_obstacles'):
-            for obs_id in self.robot_sim.line_generator.current_obstacles:
-                obs_pos, _ = p.getBasePositionAndOrientation(obs_id, physicsClientId=self.robot_sim.client_id)
-                self._obstacle_cache.append(np.array(obs_pos[:2]))
-
     def calculate_reward(self, action: Tuple[float, float]):
         reward = 0.0
 
@@ -77,39 +77,16 @@ class RewardFunction:
                 closest_point_on_track  = projection
 
         if closest_point_on_track is None:
-            return -10.0, float('inf')
+            return -10.0, float('inf'), False
 
         distance_from_line = min_distance_to_track
 
-        # --- Obstacle Avoidance & Off-Line Penalty ---
-        min_obstacle_dist = float('inf')
-        for obs_pos in self._obstacle_cache:
-            dist = float(np.linalg.norm(robot_pos - obs_pos))
-            if dist < min_obstacle_dist:
-                min_obstacle_dist = dist
-        
-        obstacle_avoidance_radius = 0.4 # Range where robot can leave line to avoid obstacle
-        obstacle_crash_radius = 0.08
-        
-        effective_distance_from_line = distance_from_line
-        
-        if min_obstacle_dist < obstacle_avoidance_radius:
-            # We are near an obstacle, relax off-line penalty to allow going around
-            effective_distance_from_line = max(0.0, distance_from_line - 0.2)
-            
-            # Penalize proximity to obstacle
-            if min_obstacle_dist < obstacle_crash_radius:
-                reward -= 50.0 # Crash into obstacle
-            else:
-                # Small continuous penalty as it gets closer
-                reward -= 2.0 * (1.0 - min_obstacle_dist / obstacle_avoidance_radius)
-        else:
-            # Normal Off-Line Penalty
-            if distance_from_line > self.config.LINE_WIDTH_RANGE[1] / 2:
-                reward -= 1.0
+        # --- Off-Line Penalty ---
+        if distance_from_line > self.config.LINE_WIDTH_RANGE[1] / 2:
+            reward -= 1.0
 
         # --- Line Centering Penalty ---
-        line_centering_penalty = min(1.0, (effective_distance_from_line / self.config.LINE_WIDTH_RANGE[1]) ** 2)
+        line_centering_penalty = min(1.0, (distance_from_line / self.config.LINE_WIDTH_RANGE[1]) ** 2)
         reward -= line_centering_penalty * 0.1
 
         # --- Alignment Penalty ---
@@ -118,9 +95,6 @@ class RewardFunction:
             angle_diff  = abs(robot_yaw - ideal_yaw)
             angle_diff  = np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
             alignment_penalty = min(1.0, (angle_diff / (np.pi / 4)) ** 2)
-            # Relax alignment penalty if avoiding obstacle
-            if min_obstacle_dist < obstacle_avoidance_radius:
-                alignment_penalty *= 0.1
             reward -= alignment_penalty * 0.2
 
         # --- Survival Bonus ---
@@ -149,10 +123,36 @@ class RewardFunction:
             reward -= 0.5
 
         # --- Crash Penalty ---
-        if distance_from_line > self.config.LINE_WIDTH_RANGE[1] * 1.5 and min_obstacle_dist >= obstacle_avoidance_radius:
+        if distance_from_line > self.config.LINE_WIDTH_RANGE[1] * 1.5:
             reward -= 50.0
 
-        return reward, effective_distance_from_line
+        # --- Goal Reached ---
+        # Exactly one red line per track now (line_generator._generate_goal_line),
+        # always at the true end — reaching it near-enough is the episode's success
+        # condition, symmetric with the crash penalty above. Threshold matches
+        # expert_controller's stop-at-red-line distance (0.15m) below: once the
+        # controller stops there, the goal must already register as reached, or the
+        # robot would sit motionless a few cm short of success forever.
+        goal_reached = False
+        for red_pos in self._red_line_cache:
+            if np.linalg.norm(robot_pos - red_pos) < 0.15:
+                reward += 50.0
+                goal_reached = True
+                break
+
+        normalized_reward = self._normalize_reward(reward)
+        return normalized_reward, distance_from_line, goal_reached
+
+    def _normalize_reward(self, reward: float) -> float:
+        """Running z-score normalization (Welford's online algorithm)."""
+        self._reward_count += 1
+        delta = reward - self._reward_mean
+        self._reward_mean += delta / self._reward_count
+        self._reward_m2   += delta * (reward - self._reward_mean)
+        if self._reward_count < 2:
+            return reward
+        std = np.sqrt(self._reward_m2 / (self._reward_count - 1))
+        return (reward - self._reward_mean) / (std + 1e-6)
 
     def reset(self):
         self.last_robot_pos = None
@@ -161,6 +161,85 @@ class RewardFunction:
         self.consecutive_visited_frames = 0
         # Rebuild geometry cache for the new track
         self._build_segment_cache()
+
+    def get_future_waypoints(self, robot_pos, robot_yaw, num_waypoints: int, spacing: float) -> np.ndarray:
+        """
+        Ground-truth "route ahead" for the planner's route head.
+
+        Returns `num_waypoints` points sampled along the track polyline in front of
+        the robot, spaced `spacing` metres apart, expressed in the robot EGO frame
+        (x = forward, y = left). Past the end of the track the final tangent is
+        extrapolated so the route keeps pointing forward.
+
+        Reuses the ordered segment geometry from self._segment_cache (the same
+        projection math as calculate_reward). Shape: (num_waypoints, 2) float32.
+        """
+        robot_pos = np.asarray(robot_pos[:2], dtype=np.float64)
+
+        # 1. Nearest segment + projection param (which point on the polyline we're at).
+        best = None  # (seg_idx, t, dist)
+        for idx, (start_pt, end_pt, direction, line_vec, line_len) in enumerate(self._segment_cache):
+            if line_len <= 0:
+                continue
+            t = max(0.0, min(1.0, float(np.dot(robot_pos - start_pt[:2], line_vec[:2]) / line_len)))
+            proj = start_pt[:2] + t * line_vec[:2]
+            dist = float(np.linalg.norm(robot_pos - proj))
+            if best is None or dist < best[2]:
+                best = (idx, t, dist)
+
+        waypoints = []
+        if best is None or not self._segment_cache:
+            # No track — waypoints straight ahead in ego frame.
+            for k in range(1, num_waypoints + 1):
+                waypoints.append([k * spacing, 0.0])
+            return np.asarray(waypoints, dtype=np.float32)
+
+        # 2. March forward along the polyline collecting points at k*spacing.
+        seg_idx, t, _ = best
+        targets = [k * spacing for k in range(1, num_waypoints + 1)]
+        ti = 0
+        travelled = 0.0
+
+        cur_idx = seg_idx
+        cur_start, cur_end, cur_dir, cur_vec, cur_len = self._segment_cache[cur_idx]
+        seg_length = float(np.linalg.norm(cur_vec[:2]))
+        cur_point = cur_start[:2] + t * cur_vec[:2]
+        remaining_on_seg = seg_length * (1.0 - t)
+        last_dir = cur_dir[:2]
+
+        while ti < len(targets):
+            need = targets[ti] - travelled
+            if need <= remaining_on_seg or cur_idx >= len(self._segment_cache) - 1:
+                if need <= remaining_on_seg:
+                    cur_point = cur_point + last_dir * need
+                    travelled = targets[ti]
+                    remaining_on_seg -= need
+                    waypoints.append(cur_point.copy())
+                    ti += 1
+                else:
+                    # Past track end: extrapolate along the final tangent.
+                    cur_point = cur_point + last_dir * need
+                    waypoints.append(cur_point.copy())
+                    travelled = targets[ti]
+                    ti += 1
+            else:
+                # Advance to the next segment.
+                travelled += remaining_on_seg
+                cur_point = cur_end[:2].copy()
+                cur_idx += 1
+                cur_start, cur_end, cur_dir, cur_vec, cur_len = self._segment_cache[cur_idx]
+                seg_length = float(np.linalg.norm(cur_vec[:2]))
+                remaining_on_seg = seg_length
+                last_dir = cur_dir[:2]
+
+        # 3. World -> ego frame (x forward, y left).
+        fwd  = np.array([np.cos(robot_yaw),  np.sin(robot_yaw)])
+        left = np.array([-np.sin(robot_yaw), np.cos(robot_yaw)])
+        ego = []
+        for wp in waypoints:
+            d = np.asarray(wp) - robot_pos
+            ego.append([float(np.dot(d, fwd)), float(np.dot(d, left))])
+        return np.asarray(ego, dtype=np.float32)
 
     def expert_controller(self, robot_sim, config) -> Tuple[float, float]:
         robot_pos_pb, robot_ori_pb = p.getBasePositionAndOrientation(
@@ -174,24 +253,7 @@ class RewardFunction:
                 # Stop if near a red line
                 return (0.0, 0.0)
 
-        # 2. Avoid obstacles
-        for obs_pos in self._obstacle_cache:
-            vec_to_obs = obs_pos - robot_pos
-            dist = np.linalg.norm(vec_to_obs)
-            if dist < 0.3:
-                # Steer away from obstacle
-                angle_to_obs = np.arctan2(vec_to_obs[1], vec_to_obs[0])
-                angle_diff = angle_to_obs - robot_yaw
-                angle_diff = np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
-                
-                # If obstacle is ahead (within 90 degrees)
-                if abs(angle_diff) < np.pi/2:
-                    if angle_diff > 0:
-                        return (0.6, 0.2) # Turn Right
-                    else:
-                        return (0.2, 0.6) # Turn Left
-
-        # 3. Follow Line
+        # 2. Follow Line
         closest_point_on_track = None
         closest_segment_tangent = None
         min_distance_to_track = float('inf')
@@ -218,7 +280,15 @@ class RewardFunction:
         angle_diff = target_angle - robot_yaw
         angle_diff = np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
         
-        base_speed = 0.5
+        # 0.75 is close to the max that still leaves the sharpest designed
+        # curve (MIN_TURN_RADIUS=0.1m, arc-length == lookahead_distance=0.1m
+        # -> tangent swings ~1.0 rad within the lookahead window) enough
+        # differential-steering headroom: both wheels only fully saturate
+        # (left->0, right->1) once |angle_diff| >= base_speed/kp = 0.938 rad,
+        # just under the 1.0 rad the tightest curve produces. Any higher and
+        # the outer wheel clips before the inner one reaches 0, softening
+        # turn authority exactly on the hardest corners.
+        base_speed = 0.75
         kp = 0.8
         
         left_motor = base_speed - kp * angle_diff
