@@ -156,6 +156,10 @@ def _train_step(
             return None
         if scaler is not None:
             scaler.scale(loss).backward()
+            # Clipping must run on unscaled gradients — clipping the scaled
+            # ones (e.g. x65536) against max_norm=1.0 clips everything to a
+            # near-zero post-unscale magnitude and stalls training.
+            scaler.unscale_(model.optimizer)
             _clip_grad_norm(model.parameters(), max_norm=1.0)
             scaler.step(model.optimizer)
             scaler.update()
@@ -224,11 +228,12 @@ def run_training():
         except Exception as e:
             print(f"  torch.compile skipped: {e}")
 
-    # No GradScaler needed: CUDA path now autocasts to bfloat16 (see _train_step),
-    # which has fp32's exponent range and so doesn't underflow/overflow the way
-    # fp16 does — GradScaler exists specifically to work around that fp16 failure
-    # mode. DirectML/CPU also skip it (plain float32 throughout).
-    scaler = None
+    # GradScaler is only needed on the fp16 autocast fallback (Turing cards like
+    # the T4, which lack bf16 tensor-core support — see config.CUDA_AMP_DTYPE).
+    # bf16 (Ampere+/Ada) has fp32's exponent range and can't underflow the way
+    # fp16 does, so it skips the scaler entirely. DirectML/CPU also skip it
+    # (plain float32 throughout).
+    scaler = torch.amp.GradScaler('cuda') if getattr(config, "USE_GRAD_SCALER", False) else None
 
     # Warmup -> cosine LR schedule (steps on every gradient update)
     scheduler = _make_lr_scheduler(robot_model.optimizer, config)

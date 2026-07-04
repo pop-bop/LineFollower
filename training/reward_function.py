@@ -40,7 +40,7 @@ class RewardFunction:
             end_pt   = np.array(seg_pos[:2]) + direction * (length / 2)
             line_vec = end_pt - start_pt
             line_len = float(np.dot(line_vec, line_vec))
-            
+
             # Check if this segment is a red line
             visual_data = p.getVisualShapeData(segment_id, physicsClientId=self.robot_sim.client_id)
             is_red_line = False
@@ -49,9 +49,55 @@ class RewardFunction:
                 if rgba[0] > 0.9 and rgba[1] < 0.1 and rgba[2] < 0.1:
                     is_red_line = True
                     self._red_line_cache.append(np.array(seg_pos[:2]))
-            
+
             if not is_red_line:
                 self._segment_cache.append((start_pt, end_pt, direction, line_vec, line_len))
+
+        # Stacked-array mirror of _segment_cache for the vectorized nearest-
+        # segment lookup (_nearest_segment) — calculate_reward and
+        # expert_controller each ran this same closest-point-on-polyline scan
+        # as a plain Python for-loop over every cached segment (~70 on average,
+        # up to 112 on curve/zigzag-heavy tracks), every single environment
+        # step, duplicating the identical computation twice per step. Building
+        # these once per episode (here) and doing the scan as vectorized NumPy
+        # ops instead collapses that per-step Python loop into a few array
+        # calls — profiled at ~76% of Phase-2 per-chunk wall-clock before this
+        # change.
+        if self._segment_cache:
+            self._seg_start     = np.stack([s[0] for s in self._segment_cache])
+            self._seg_line_vec  = np.stack([s[3] for s in self._segment_cache])
+            self._seg_line_len  = np.array([s[4] for s in self._segment_cache])
+            self._seg_direction = np.stack([s[2] for s in self._segment_cache])
+        else:
+            self._seg_start     = np.zeros((0, 2))
+            self._seg_line_vec  = np.zeros((0, 2))
+            self._seg_line_len  = np.zeros((0,))
+            self._seg_direction = np.zeros((0, 2))
+
+    def _nearest_segment(self, robot_pos: np.ndarray):
+        """
+        Vectorized closest-point-on-track lookup — replaces the Python
+        for-loop previously duplicated in calculate_reward, expert_controller,
+        and get_future_waypoints. Same math (clip projection param to [0,1],
+        nearest by Euclidean distance, first-occurrence tie-break to match
+        the original loop's strict `<` comparison), just computed over
+        stacked arrays instead of iterating segment-by-segment in Python.
+
+        Returns (idx, t, dist) of the closest segment, or (None, None, None)
+        if the cache is empty.
+        """
+        n = self._seg_start.shape[0]
+        if n == 0:
+            return None, None, None
+        pt_vecs = robot_pos[np.newaxis, :] - self._seg_start                  # (N,2)
+        dots = np.einsum('ij,ij->i', pt_vecs, self._seg_line_vec)             # (N,)
+        safe_len = np.where(self._seg_line_len > 0, self._seg_line_len, 1.0)
+        t = np.where(self._seg_line_len > 0, dots / safe_len, 0.0)
+        t = np.clip(t, 0.0, 1.0)
+        projections = self._seg_start + t[:, np.newaxis] * self._seg_line_vec  # (N,2)
+        dists = np.linalg.norm(robot_pos[np.newaxis, :] - projections, axis=1)
+        idx = int(np.argmin(dists))
+        return idx, float(t[idx]), float(dists[idx])
 
     def calculate_reward(self, action: Tuple[float, float]):
         reward = 0.0
@@ -62,24 +108,12 @@ class RewardFunction:
         robot_yaw = p.getEulerFromQuaternion(robot_ori_pb)[2]
 
         # Use cached segment geometry — no AABB or getBasePositionAndOrientation per step
-        closest_point_on_track = None
-        closest_segment_tangent = None
-        min_distance_to_track = float('inf')
-
-        for (start_pt, end_pt, direction, line_vec, line_len) in self._segment_cache:
-            pt_vec = robot_pos - start_pt
-            t = max(0.0, min(1.0, np.dot(pt_vec, line_vec) / line_len)) if line_len > 0 else 0.0
-            projection = start_pt + t * line_vec
-            dist = float(np.linalg.norm(robot_pos - projection))
-            if dist < min_distance_to_track:
-                min_distance_to_track = dist
-                closest_segment_tangent = direction
-                closest_point_on_track  = projection
-
-        if closest_point_on_track is None:
+        idx, t, dist = self._nearest_segment(robot_pos)
+        if idx is None:
             return -10.0, float('inf'), False
 
-        distance_from_line = min_distance_to_track
+        closest_segment_tangent = self._seg_direction[idx]
+        distance_from_line = dist
 
         # --- Off-Line Penalty ---
         if distance_from_line > self.config.LINE_WIDTH_RANGE[1] / 2:
@@ -177,15 +211,8 @@ class RewardFunction:
         robot_pos = np.asarray(robot_pos[:2], dtype=np.float64)
 
         # 1. Nearest segment + projection param (which point on the polyline we're at).
-        best = None  # (seg_idx, t, dist)
-        for idx, (start_pt, end_pt, direction, line_vec, line_len) in enumerate(self._segment_cache):
-            if line_len <= 0:
-                continue
-            t = max(0.0, min(1.0, float(np.dot(robot_pos - start_pt[:2], line_vec[:2]) / line_len)))
-            proj = start_pt[:2] + t * line_vec[:2]
-            dist = float(np.linalg.norm(robot_pos - proj))
-            if best is None or dist < best[2]:
-                best = (idx, t, dist)
+        idx, t, dist = self._nearest_segment(robot_pos)
+        best = None if idx is None else (idx, t, dist)
 
         waypoints = []
         if best is None or not self._segment_cache:
@@ -254,23 +281,13 @@ class RewardFunction:
                 return (0.0, 0.0)
 
         # 2. Follow Line
-        closest_point_on_track = None
-        closest_segment_tangent = None
-        min_distance_to_track = float('inf')
-
-        for (start_pt, end_pt, direction, line_vec, line_len) in self._segment_cache:
-            pt_vec = robot_pos - start_pt
-            t = max(0.0, min(1.0, np.dot(pt_vec, line_vec) / line_len)) if line_len > 0 else 0.0
-            projection = start_pt + t * line_vec
-            dist = float(np.linalg.norm(robot_pos - projection))
-            if dist < min_distance_to_track:
-                min_distance_to_track = dist
-                closest_segment_tangent = direction
-                closest_point_on_track  = projection
-                
-        if closest_point_on_track is None or closest_segment_tangent is None:
+        idx, t, dist = self._nearest_segment(robot_pos)
+        if idx is None:
             return (0.0, 0.0)
-            
+
+        closest_segment_tangent = self._seg_direction[idx]
+        closest_point_on_track  = self._seg_start[idx] + t * self._seg_line_vec[idx]
+
         lookahead_distance = 0.1
         target_point = closest_point_on_track + closest_segment_tangent * lookahead_distance
         
